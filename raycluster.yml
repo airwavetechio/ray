@@ -1,0 +1,318 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: raycluster-autoscaler
+spec:
+  rayVersion: "2.43.0"
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    upscalingMode: Default
+    idleTimeoutSeconds: 300
+    imagePullPolicy: IfNotPresent
+    # Optionally specify the Autoscaler container's securityContext.
+    securityContext: {}
+    env:
+    envFrom: []
+    resources:
+      limits:
+        cpu: "4"
+        memory: "8G"
+      requests:
+        cpu: "1"
+        memory: "2G"
+  # Ray head pod template
+  headGroupSpec:
+    rayStartParams:
+      # Setting "num-cpus: 0" to avoid any Ray actors or tasks being scheduled on the Ray head Pod.
+      num-cpus: "0"
+      # Use `resources` to optionally specify custom resource annotations for the Ray node.
+      # The value of `resources` is a string-integer mapping.
+      # Currently, `resources` must be provided in the specific format demonstrated below:
+      # resources: '"{\"Custom1\": 1, \"Custom2\": 5}"'
+    # Pod template
+    template:
+      spec:
+        # For volume permissions mainly
+        # https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#configure-volume-permission-and-ownership-change-policy-for-pods
+        # You get the IDs from exec'ing into the pod and running id -u ray and id -g ray
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 100
+          fsGroup: 100
+        containers:
+          # The Ray head container
+          - name: ray-head
+
+            image: rayproject/ray:2.44.1-py311
+            imagePullPolicy: Always
+            env:
+              # This maximizies the 16CPU nodes
+              - name: NUMEXPR_MAX_THREADS
+                value: "16"
+              - name: RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING
+                value: "1"
+                #https://docs.ray.io/en/master/ray-core/handling-dependencies.html#runtime-environment-specified-by-both-job-and-driver
+              - name: RAY_OVERRIDE_JOB_RUNTIME_ENV
+                value: "1"
+              - name: RAY_worker_register_timeout_seconds
+                value: "600"
+            ports:
+              - containerPort: 6379
+                name: gcs
+              - containerPort: 8265
+                name: dashboard
+              - containerPort: 10001
+                name: client
+              - containerPort: 22
+                name: ssd
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sh", "-c", "ray stop"]
+            resources:
+              limits:
+                cpu: "4"
+                memory: "8G"
+              requests:
+                cpu: "1"
+                memory: "2G"
+            volumeMounts:
+              - mountPath: /home/ray/samples
+                name: ray-example-configmap
+              - mountPath: /mnt/data
+                name: filestore
+              # - mountPath: /tmp/ray
+              # name: tmplogs
+        volumes:
+          - name: filestore
+            persistentVolumeClaim:
+              claimName: fileserver
+          # - name: tmplogs
+          #   persistentVolumeClaim:
+          #     claimName: tmplogs
+          - name: ray-example-configmap
+            configMap:
+              name: ray-example
+              defaultMode: 0777
+              items:
+                - key: test_4_gpu.py
+                  path: test_4_gpu.py
+                - key: test_gpu_by_4.py
+                  path: test_gpu_by_4.py
+  workerGroupSpecs:
+    # the Pod replicas in this group typed worker
+    - replicas: 0
+      minReplicas: 0
+      maxReplicas: 10
+      # logical group name, for this called small-group, also can be functional
+      groupName: small-group
+      # If worker pods need to be added, Ray Autoscaler can increment the `replicas`.
+      # If worker pods need to be removed, Ray Autoscaler decrements the replicas, and populates the `workersToDelete` list.
+      # KubeRay operator will remove Pods from the list until the desired number of replicas is satisfied.
+      #scaleStrategy:
+      #  workersToDelete:
+      #  - raycluster-complete-worker-small-group-bdtwh
+      #  - raycluster-complete-worker-small-group-hv457
+      #  - raycluster-complete-worker-small-group-k8tj7
+      rayStartParams: {}
+      # Pod template
+      template:
+        spec:
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 100
+            fsGroup: 100
+          containers:
+            - name: ray-worker
+              image: rayproject/ray:2.44.1-py311
+              imagePullPolicy: Always
+              env:
+                # This maximizies the 16CPU nodes
+                - name: NUMEXPR_MAX_THREADS
+                  value: "16"
+                - name: RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING
+                  value: "1"
+                - name: RAY_OVERRIDE_JOB_RUNTIME_ENV
+                  value: "1"
+              lifecycle:
+                preStop:
+                  exec:
+                    command: ["/bin/sh", "-c", "ray stop"]
+              resources:
+                limits:
+                  cpu: "16"
+                  memory: "32G"
+                requests:
+                  cpu: "8"
+                  memory: "16G"
+              volumeMounts:
+                - mountPath: /home/ray/samples
+                  name: ray-example-configmap
+                - mountPath: /mnt/data
+                  name: filestore
+          volumes:
+            - name: filestore
+              persistentVolumeClaim:
+                claimName: fileserver
+            - name: ray-example-configmap
+              configMap:
+                name: ray-example
+                defaultMode: 0777
+                items:
+                  - key: test_4_gpu.py
+                    path: test_4_gpu.py
+                  - key: test_gpu_by_4.py
+                    path: test_gpu_by_4.py
+    - groupName: a100-gpu-group-1
+      replicas: 0
+      minReplicas: 0
+      maxReplicas: 5
+      rayStartParams: {}
+      #pod template
+      template:
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                  - matchExpressions:
+                      - key: cloud.google.com/gke-accelerator
+                        operator: In
+                        values: ["nvidia-tesla-t4"]
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 100
+            fsGroup: 100
+          containers:
+            - name: ray-worker # must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character (e.g. 'my-name',  or '123-abc'
+              image: rayproject/ray-ml:2.44.1.deprecated-py311-gpu
+              imagePullPolicy: Always
+              env:
+                # This maximizies the 16CPU nodes
+                - name: NUMEXPR_MAX_THREADS
+                  value: "16"
+                - name: RAY_ENABLE_RECORD_ACTOR_TASK_LOGGING
+                  value: "1"
+                # - name: RAY_OVERRIDE_JOB_RUNTIME_ENV
+                #   value: "1"
+                - name: RAY_BACKEND_LOG_LEVEL
+                  value: "debug"
+              lifecycle:
+                preStop:
+                  exec:
+                    command: ["/bin/sh", "-c", "ray stop"]
+              resources:
+                limits:
+                  cpu: "16"
+                  memory: "32G"
+                  nvidia.com/gpu: 1
+                requests:
+                  cpu: "8"
+                  memory: "16G"
+                  nvidia.com/gpu: 1
+              volumeMounts:
+                - mountPath: /home/ray/samples
+                  name: ray-example-configmap
+                - mountPath: /mnt/data
+                  name: filestore
+          volumes:
+            - name: filestore
+              persistentVolumeClaim:
+                claimName: fileserver
+            - name: ray-example-configmap
+              configMap:
+                name: ray-example
+                defaultMode: 0777
+                items:
+                  - key: test_4_gpu.py
+                    path: test_4_gpu.py
+                  - key: test_gpu_by_4.py
+                    path: test_gpu_by_4.py
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ray-example
+data:
+  test_4_gpu.py: |
+    import ray
+    @ray.remote(num_gpus=0.25)
+    def use_gpu():
+        import torch  # Assuming you have PyTorch installed, which uses CUDA for GPU acceleration
+
+        # Check if a GPU is available
+        is_gpu_available = torch.cuda.is_available()
+        device = torch.device("cuda:0" if is_gpu_available else "cpu")
+
+        # Create a tensor and move it to GPU if available
+        # Check if a GPU is available
+        is_gpu_available = torch.cuda.is_available()
+        device = torch.device("cuda:0" if is_gpu_available else "cpu")
+
+        # Create a tensor and move it to GPU if available
+        x = torch.randn(3, 3).to(device)
+        y = torch.randn(3, 3).to(device)
+        result = x + y
+
+        return is_gpu_available, result.cpu().numpy()
+
+    # Run the function remotely
+    future = use_gpu.remote()
+
+    # Get the result
+    is_gpu_available, result = ray.get(future)
+
+    if is_gpu_available:
+        print("GPU is available!")
+        print("Result of the computation:", result)
+        print("If you see numbers above, this Ray Cluster can do things with GPU")
+    else:
+        print("GPU is not available.")
+  test_gpu_by_4.py: |
+    import ray
+    import numpy as np
+
+    # Initialize Ray
+    ray.init()
+
+    @ray.remote(num_gpus=1)  # Each task will use 1.0 GPU
+    def use_gpu(task_id):
+        import torch  # Assuming PyTorch is installed and supports CUDA
+
+        # Check if a GPU is available
+        is_gpu_available = torch.cuda.is_available()
+        device = torch.device("cuda:0" if is_gpu_available else "cpu")
+
+        # Perform a small computation on the GPU (if available)
+        x = torch.randn(3, 3).to(device)
+        y = torch.randn(3, 3).to(device)
+        result = x + y
+
+        # Return the result and status
+        return {
+            "task_id": task_id,
+            "gpu_available": is_gpu_available,
+            "result": result.cpu().numpy() if is_gpu_available else None,
+        }
+
+    # Main function to execute tasks in parallel
+    def main():
+        num_tasks = 4  # Number of tasks to run in parallel
+        print(f"Running {num_tasks} tasks in parallel using Ray with GPU...")
+
+        # Submit tasks to the Ray cluster
+        futures = [use_gpu.remote(i) for i in range(num_tasks)]
+
+        # Collect results
+        results = ray.get(futures)
+
+        # Display results
+        for res in results:
+            if res["gpu_available"]:
+                print(f"Task {res['task_id']}: GPU is available!")
+                print(f"Task {res['task_id']}: Result of computation:\n{res['result']}")
+            else:
+                print(f"Task {res['task_id']}: GPU is not available.")
+
+    if __name__ == "__main__":
+        main()
